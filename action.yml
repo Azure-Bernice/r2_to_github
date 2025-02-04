@@ -198,6 +198,8 @@ runs:
 
                 # 记录操作报告
                 REPORT+="\n已成功${COPY_OR_MOVE} CloudFlare R2 ${R2_ACCOUNT_NAME[n]} ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
+
+                # 如果有大于 100MB 的文件，输出到最终总结报告
                 if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
                   [ "${#SKIP_FILE[@]}" = 1 ] && REPORT+="\nWarning: ${R2_ACCOUNT_NAME[n]} 1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]#*/}" || REPORT+="\nWarning: ${R2_ACCOUNT_NAME[n]} ${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]#*/}"
                 fi
@@ -214,9 +216,13 @@ runs:
         # 处理 B2 存储（如果存在）
         # 这部分代码逻辑与 R2 处理基本相同，主要区别在于处理 B2 存储的特定细节
         if [ "${#B2_ENDPOINT_URL[@]}" -gt 0 ]; then
+          # 安装 Backblaze 专用 b2 命令行工具
+          [ ! "$(type -p b2)" ] && echo "安装 Backblaze 专用 b2 命令行工具" && pip install b2 >/dev/null 2>&1
+
           for n in ${!B2_ACCOUNT_NAME[@]}; do
             aws configure set aws_access_key_id ${B2_KEY_ID[n]}
             aws configure set aws_secret_access_key ${B2_APPLICATION_KEY[n]}
+            b2 account authorize ${B2_KEY_ID[n]} ${B2_APPLICATION_KEY[n]} >/dev/null 2>&1
 
             # 获取 B2 中的所有文件列表
             unset FILE_DETAIL FILE_LIST FILE_SIZE SUCCESS_UPDATE NEED_MOVE_FILE SKIP_FILE DELETE_FILE FILE_COUNTER B2_DOWNLOAD_FAIL B2_DOWNLOAD_SUCCESS
@@ -224,82 +230,97 @@ runs:
                                 --endpoint-url="${B2_ENDPOINT_URL[n]}" \
                                 --bucket "${B2_BUCKET[n]}")
 
-            grep -q '"Key"' <<< "${FILE_DETAIL_ALL}" && FILE_DETAIL=$(jq '.Versions[] | select(.Key | contains(".bzEmpty") | not) | {Size, Key, VersionId}' <<< "${FILE_DETAIL_ALL}")
-            if [ "$(jq -s 'length' <<< "${FILE_DETAIL}")" -gt 0 ]; then
-              FILE_LIST=($(jq -r '.Key' <<< "${FILE_DETAIL}"))
-              FILE_SIZE=($(jq -r '.Size' <<< "${FILE_DETAIL}"))
-              FILE_VERSION_ID=($(jq -r '.VersionId' <<< "${FILE_DETAIL}"))
+            # B2 桶有版本控制，会创建一个 DeleteMarker 对象来标记该文件已被删除。判断是否有这类文件，如有则先彻底删除
+            if [ $(jq 'has("DeleteMarkers")' <<< "$FILE_DETAIL_ALL") = 'true' ]; then
+              DELETEMARKERS_FILE_DETAIL=$(jq '.DeleteMarkers[] | select(.Key | contains(".bzEmpty") | not) | {Key, VersionId}' <<< "${FILE_DETAIL_ALL}")
+              if [ "$(jq -s 'length' <<< "${DELETEMARKERS_FILE_DETAIL}")" -gt 0 ]; then
+                DELETEMARKERS_FILE_LIST=($(jq -r '.Key' <<< "${DELETEMARKERS_FILE_DETAIL}"))
+                DELETEMARKERS_FILE_VERSION_ID=($(jq -r '.VersionId' <<< "${DELETEMARKERS_FILE_DETAIL}"))
+                for r in ${!DELETEMARKERS_FILE_VERSION_ID[@]}; do
+                  echo -e "\n先彻底删除已标记文件 ${DELETEMARKERS_FILE_LIST[r]} 的所有历史版本"
+                  aws s3api delete-object \
+                  --endpoint-url="${B2_ENDPOINT_URL[n]}" \
+                  --bucket "${B2_BUCKET[n]}" \
+                  --key "${DELETEMARKERS_FILE_LIST[r]}" \
+                  --version-id "${DELETEMARKERS_FILE_VERSION_ID[r]}"
+                done
+              fi
             fi
 
-            # 如果有文件需要处理，则遍历文件列表，检查每个文件的大小，文件小于等于 100MB ,并且大于 0b 的加入迁移列表
-            if [ "${#FILE_LIST[@]}" -gt 0 ]; then
-              for k in "${!FILE_LIST[@]}"; do
-                [ "${FILE_SIZE[k]}" -le 104857600 ] && NEED_MOVE_FILE+=(${FILE_LIST[k]}) || SKIP_FILE+=(${FILE_LIST[k]})
-              done
-            fi
-
-            # 如果有文件需要处理
-            if [ "${#NEED_MOVE_FILE[@]}" -gt 0 ]; then
-              # 克隆目标仓库
-              [ ! -d "${REPO_NAME}" ] && echo "克隆节点 ${REPO_NAME}" && git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
-              cd ${REPO_NAME}
-
-              # 将符合条件的文件下载到本地，并记录需要删除文件的 VersionId
-              B2_DOWNLOAD_FAIL=0
-              B2_DOWNLOAD_SUCCESS=0
-              echo "================================="
-              for l in "${NEED_MOVE_FILE[@]}"; do
-                (( FILE_COUNTER++ )) || true
-                echo "${B2_ACCOUNT_NAME[n]} copying ${FILE_COUNTER} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
-                B2_DOWNLOAD_QUOTA=$(aws s3 cp --endpoint-url=${B2_ENDPOINT_URL[n]} s3://${B2_BUCKET[n]}/${l} ${l} 2>&1) || true
-                if grep -q "operation: Forbidden" <<< "${B2_DOWNLOAD_QUOTA}"; then
-                  (( B2_DOWNLOAD_FAIL++ )) || true
-                  break
-                else
-                  (( B2_DOWNLOAD_SUCCESS++ )) || true
-                  [ "${DELETE,,}" = 'true' ] && DELETE_VERSION_ID+=($(aws s3api list-object-versions \
-                                                                      --endpoint-url="${B2_ENDPOINT_URL[n]}" \
-                                                                      --bucket "${B2_BUCKET[n]}" \
-                                                                      --prefix "${l}" \
-                                                                      --output json | awk -F '[",]' '/VersionId/{print $4}'))
-                fi
-              done
-
-              # 提交更改到 GitHub
-              git add .
-              git commit -m "Add files from Backblaze B2 ${B2_ACCOUNT_NAME[n]}" || echo "No changes to commit"
-              git push -f && SUCCESS_UPDATE=true || echo "No changes to push"
-              cd ..
-              if [ "${SUCCESS_UPDATE}" = 'true' ]; then
-                # 删除已经迁移的文件
-                if [ "${DELETE,,}" = 'true' ]; then
-                  COPY_OR_MOVE='迁移'
-                  echo "Delete files from Backblaze B2 ${B2_ACCOUNT_NAME[n]}"
-                  for q in ${!DELETE_VERSION_ID[@]}; do
-                    aws s3api delete-object \
-                      --endpoint-url="${B2_ENDPOINT_URL[n]}" \
-                      --bucket "${B2_BUCKET[n]}" \
-                      --key "${NEED_MOVE_FILE[q]}" \
-                      --version-id "${DELETE_VERSION_ID[q]}"
-                  done
-                else
-                  COPY_OR_MOVE='复制'
-                fi
-
-                # 根据成功和失败的文件个数，反馈结果
-                if [[ "$B2_DOWNLOAD_FAIL" -gt 0 && "${B2_DOWNLOAD_SUCCESS}" = 0 ]]; then
-                  REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} 每天下载总量大于 1GB，中止本桶的操作"
-                elif [[ "$B2_DOWNLOAD_FAIL" -gt 0 && "${B2_DOWNLOAD_SUCCESS}" -gt 0 ]]; then
-                  REPORT+="\n已成功${COPY_OR_MOVE} Backblaze B2 ${B2_ACCOUNT_NAME[n]} ${B2_DOWNLOAD_SUCCESS} 个文件 ---> ${REPO_NAME}\n但由于每天下载总量大于 1GB，有 ${B2_DOWNLOAD_FAIL} 个文件没有${COPY_OR_MOVE}"
-                elif [[ "$B2_DOWNLOAD_FAIL" = 0 && "${B2_DOWNLOAD_SUCCESS}" -gt 0 ]]; then
-                  REPORT+="\n已成功${COPY_OR_MOVE} Backblaze B2 ${B2_ACCOUNT_NAME[n]} ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
-                fi
-
-                if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
-                  [ "${#SKIP_FILE[@]}" = 1 ] && REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} 1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]#*/}" || REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} ${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]#*/}"
-                fi
+            # 判断是否有 Versions 存储对象
+            if [ $(jq 'has("Versions")' <<< "$FILE_DETAIL_ALL") = 'true' ]; then
+              FILE_DETAIL=$(jq '.Versions[] | select(.Key | contains(".bzEmpty") | not) | {Size, Key, VersionId}' <<< "${FILE_DETAIL_ALL}")
+              if [ "$(jq -s 'length' <<< "${FILE_DETAIL}")" -gt 0 ]; then
+                FILE_LIST=($(jq -r '.Key' <<< "${FILE_DETAIL}"))
+                FILE_SIZE=($(jq -r '.Size' <<< "${FILE_DETAIL}"))
+                FILE_VERSION_ID=($(jq -r '.VersionId' <<< "${FILE_DETAIL}"))
               else
-                REPORT+="\nGitHub: ${REPO_NAME} 更新失败"
+                REPORT+="\nBackblaze B2 ${B2_ACCOUNT_NAME[n]} 没有更新文件."
+              fi
+
+              # 如果有文件需要处理，则遍历文件列表，检查每个文件的大小，文件小于等于 100MB ,并且大于 0b 的加入迁移列表
+              if [ "${#FILE_LIST[@]}" -gt 0 ]; then
+                for k in "${!FILE_LIST[@]}"; do
+                  [ "${FILE_SIZE[k]}" -le 104857600 ] && NEED_MOVE_FILE+=(${FILE_LIST[k]}) || SKIP_FILE+=(${FILE_LIST[k]})
+                done
+              fi
+
+              # 如果有文件需要处理
+              if [ "${#NEED_MOVE_FILE[@]}" -gt 0 ]; then
+                # 克隆目标仓库
+                [ ! -d "${REPO_NAME}" ] && echo "克隆节点 ${REPO_NAME}" && git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
+                cd ${REPO_NAME}
+
+                # 将符合条件的文件下载到本地，并记录需要删除文件的 VersionId
+                B2_DOWNLOAD_FAIL=0
+                B2_DOWNLOAD_SUCCESS=0
+                echo "================================="
+                for l in "${NEED_MOVE_FILE[@]}"; do
+                  (( FILE_COUNTER++ )) || true
+                  echo "${B2_ACCOUNT_NAME[n]} copying ${FILE_COUNTER} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
+                  [ ! -d $(dirname "$l") ] && mkdir -p $(dirname "$l")
+                  B2_DOWNLOAD_QUOTA=$(b2 file download --no-progress b2://${B2_BUCKET[n]}/${l} ${l} 2>&1) || true
+                  if grep -q "download_cap_exceeded" <<< "${B2_DOWNLOAD_QUOTA}"; then
+                    (( B2_DOWNLOAD_FAIL++ )) || true
+                    break
+                  else
+                    (( B2_DOWNLOAD_SUCCESS++ )) || true
+                  fi
+                done
+
+                # 提交更改到 GitHub
+                git add .
+                git commit -m "Add files from Backblaze B2 ${B2_ACCOUNT_NAME[n]}" || echo "No changes to commit"
+                git push -f && SUCCESS_UPDATE=true || echo "No changes to push"
+                cd ..
+                if [ "${SUCCESS_UPDATE}" = 'true' ]; then
+                  # 删除已经迁移的文件
+                  if [ "${DELETE,,}" = 'true' ]; then
+                    COPY_OR_MOVE='迁移'
+                    echo "Delete files from Backblaze B2 ${B2_ACCOUNT_NAME[n]}"
+                    for q in "${NEED_MOVE_FILE[@]}"; do
+                      b2 rm --no-progress --versions "b2://${B2_BUCKET[n]}/${q}"
+                    done
+                  else
+                    COPY_OR_MOVE='复制'
+                  fi
+
+                  # 根据成功和失败的文件个数，反馈结果
+                  if [[ "$B2_DOWNLOAD_FAIL" -gt 0 && "${B2_DOWNLOAD_SUCCESS}" = 0 ]]; then
+                    REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} 每天下载总量大于 1GB，中止本桶的操作"
+                  elif [[ "$B2_DOWNLOAD_FAIL" -gt 0 && "${B2_DOWNLOAD_SUCCESS}" -gt 0 ]]; then
+                    REPORT+="\n已成功${COPY_OR_MOVE} Backblaze B2 ${B2_ACCOUNT_NAME[n]} ${B2_DOWNLOAD_SUCCESS} 个文件 ---> ${REPO_NAME}\n但由于每天下载总量大于 1GB，有 ${B2_DOWNLOAD_FAIL} 个文件没有${COPY_OR_MOVE}"
+                  elif [[ "$B2_DOWNLOAD_FAIL" = 0 && "${B2_DOWNLOAD_SUCCESS}" -gt 0 ]]; then
+                    REPORT+="\n已成功${COPY_OR_MOVE} Backblaze B2 ${B2_ACCOUNT_NAME[n]} ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
+                  fi
+                else
+                  REPORT+="\nGitHub: ${REPO_NAME} 更新失败"
+                fi
+              fi
+
+              # 如果有大于 100MB 的文件，输出到最终总结报告
+              if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
+                [ "${#SKIP_FILE[@]}" = 1 ] && REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} 1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]#*/}" || REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} ${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]#*/}"
               fi
             else
               # 如果没有文件需要处理

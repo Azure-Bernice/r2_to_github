@@ -9,6 +9,7 @@
 - 根据选择的策略将文件迁移到指定的 GitHub 仓库。
 - 支持三种策略：根据仓库文件数量最少、仓库容量最小和指定目标仓库。
 - 支持迁移后，可以选择保留或者删除 R2、B2 中的文件。
+- B2 桶有版本控制，彻底删除已标记的所有文件。
 
 ## 配置
 
@@ -51,5 +52,5 @@ jobs:
         uses: actions/checkout@v4.2.2
 
       - name: Sync files to GitHub
-        uses: fscarmen3/r2_to_github@v1.0.2
+        uses: fscarmen3/r2_to_github@v1.0.3
 ```
